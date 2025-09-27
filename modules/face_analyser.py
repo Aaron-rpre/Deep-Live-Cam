@@ -1,6 +1,6 @@
 import os
 import shutil
-from typing import Any
+from typing import Any, List
 import insightface
 
 import cv2
@@ -14,15 +14,19 @@ from pathlib import Path
 
 FACE_ANALYSER = None
 
+# Gender filter options: "male", "female", or None (no filtering)
+GENDER_FILTER = "female"  # set to None to disable filtering
 
 def get_face_analyser() -> Any:
     global FACE_ANALYSER
 
     if FACE_ANALYSER is None:
-        FACE_ANALYSER = insightface.app.FaceAnalysis(name='buffalo_l', providers=modules.globals.execution_providers)
+        FACE_ANALYSER = insightface.app.FaceAnalysis(
+            name='buffalo_l',
+            providers=modules.globals.execution_providers
+        )
         FACE_ANALYSER.prepare(ctx_id=0, det_size=(640, 640))
     return FACE_ANALYSER
-
 
 def get_one_face(frame: Frame) -> Any:
     face = get_face_analyser().get(frame)
@@ -31,12 +35,19 @@ def get_one_face(frame: Frame) -> Any:
     except ValueError:
         return None
 
-
-def get_many_faces(frame: Frame) -> Any:
+def get_many_faces(frame: Frame) -> List[Any]:
+    """
+    Original behaviour: return raw list of detected faces (may be empty/list).
+    Do NOT apply gender filtering here — keep official behaviour so other code
+    that expects all faces continues to work.
+    """
     try:
-        return get_face_analyser().get(frame)
-    except IndexError:
-        return None
+        faces = get_face_analyser().get(frame)
+        print(f"[DEBUG] faces detected: {len(faces) if faces else 0}")
+        return faces if faces is not None else []
+    except Exception:
+        return []
+
 
 def has_valid_map() -> bool:
     for map in modules.globals.source_target_map:
@@ -44,11 +55,13 @@ def has_valid_map() -> bool:
             return True
     return False
 
+
 def default_source_face() -> Any:
     for map in modules.globals.source_target_map:
         if "source" in map:
             return map['source']['face']
     return None
+
 
 def simplify_maps() -> Any:
     centroids = []
@@ -61,6 +74,7 @@ def simplify_maps() -> Any:
     modules.globals.simple_map = {'source_faces': faces, 'target_embeddings': centroids}
     return None
 
+
 def add_blank_map() -> Any:
     try:
         max_id = -1
@@ -72,34 +86,49 @@ def add_blank_map() -> Any:
                 })
     except ValueError:
         return None
-    
+
+
 def get_unique_faces_from_target_image() -> Any:
+    """
+    This function builds source_target_map for a single image target.
+    We detect all faces (official behaviour) then apply gender filter HERE
+    so source face logic elsewhere is unaffected.
+    """
     try:
         modules.globals.source_target_map = []
         target_frame = cv2.imread(modules.globals.target_path)
-        many_faces = get_many_faces(target_frame)
-        i = 0
+        many_faces = get_many_faces(target_frame)  # raw faces
+        if not many_faces:
+            return None
 
+        # apply gender filter only when building the map
+        many_faces = filter_faces_by_gender(many_faces)
+
+        i = 0
         for face in many_faces:
             x_min, y_min, x_max, y_max = face['bbox']
             modules.globals.source_target_map.append({
-                'id' : i, 
+                'id' : i,
                 'target' : {
-                            'cv2' : target_frame[int(y_min):int(y_max), int(x_min):int(x_max)],
-                            'face' : face
-                            }
-                })
-            i = i + 1
+                    'cv2' : target_frame[int(y_min):int(y_max), int(x_min):int(x_max)],
+                    'face' : face
+                }
+            })
+            i += 1
     except ValueError:
         return None
-    
-    
+
+
 def get_unique_faces_from_target_video() -> Any:
+    """
+    Video flow: keep detection behaviour the same, but apply gender filter
+    when compiling `face_embeddings` and frames into the mapping.
+    """
     try:
         modules.globals.source_target_map = []
         frame_face_embeddings = []
         face_embeddings = []
-    
+
         print('Creating temp resources...')
         clean_temp(modules.globals.target_path)
         create_temp(modules.globals.target_path)
@@ -111,13 +140,21 @@ def get_unique_faces_from_target_video() -> Any:
         i = 0
         for temp_frame_path in tqdm(temp_frame_paths, desc="Extracting face embeddings from frames"):
             temp_frame = cv2.imread(temp_frame_path)
-            many_faces = get_many_faces(temp_frame)
+            many_faces = get_many_faces(temp_frame)  # raw faces
 
-            for face in many_faces:
+            # apply gender filter to faces detected in this frame
+            many_faces_filtered = filter_faces_by_gender(many_faces)
+
+            for face in many_faces_filtered:
                 face_embeddings.append(face.normed_embedding)
-            
-            frame_face_embeddings.append({'frame': i, 'faces': many_faces, 'location': temp_frame_path})
+
+            frame_face_embeddings.append({'frame': i, 'faces': many_faces_filtered, 'location': temp_frame_path})
             i += 1
+
+        # If no embeddings after filtering, abort gracefully
+        if not face_embeddings:
+            print("[DEBUG] No face embeddings found after gender filtering; aborting mapping.")
+            return None
 
         centroids = find_cluster_centroids(face_embeddings)
 
@@ -137,11 +174,10 @@ def get_unique_faces_from_target_video() -> Any:
 
             modules.globals.source_target_map[i]['target_faces_in_frame'] = temp
 
-        # dump_faces(centroids, frame_face_embeddings)
         default_target_face()
     except ValueError:
         return None
-    
+
 
 def default_target_face():
     for map in modules.globals.source_target_map:
@@ -163,9 +199,9 @@ def default_target_face():
 
         target_frame = cv2.imread(best_frame['location'])
         map['target'] = {
-                        'cv2' : target_frame[int(y_min):int(y_max), int(x_min):int(x_max)],
-                        'face' : best_face
-                        }
+            'cv2' : target_frame[int(y_min):int(y_max), int(x_min):int(x_max)],
+            'face' : best_face
+        }
 
 
 def dump_faces(centroids: Any, frame_face_embeddings: list):

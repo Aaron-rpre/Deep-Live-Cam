@@ -175,18 +175,104 @@ def update_status(message: str, scope: str = 'DLC.CORE') -> None:
     if not modules.globals.headless:
         ui.update_status(message)
 
+from modules.face_analyser import get_one_face
+from modules.utilities import is_image, is_video
+import os
+import cv2
+import shutil
+
+def _sort_folder_by_face(folder_path: str) -> None:
+    """
+    Move any images without a face to 'unprocessed/'.
+    Ignore videos.
+    """
+    unprocessed_dir = os.path.join(folder_path, "unprocessed")
+    os.makedirs(unprocessed_dir, exist_ok=True)
+
+    for filename in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, filename)
+
+        if is_video(file_path):
+            print(f"[SKIP] Video file: {filename}")
+            continue
+
+        if not is_image(file_path):
+            print(f"[SKIP] Not an image: {filename}")
+            continue
+
+        img = cv2.imread(file_path)
+        if img is None:
+            print(f"[ERROR] Failed to read: {filename}")
+            continue
+
+        if not get_one_face(img):
+            dest_path = os.path.join(unprocessed_dir, filename)
+            print(f"[MOVE] No face found: {filename} → {dest_path}")
+            shutil.move(file_path, dest_path)
+        else:
+            print(f"[KEEP] Face detected: {filename}")
+
 
 def process_directory(source_path: str, directory_path: str) -> None:
-    """Process all images in *directory_path* the same way video frames are handled."""
+    """
+    Sorts folder by face, moves no-face images to 'Unprocessed/',
+    processes each file individually, and outputs results to 'output/'.
+    """
 
-    update_status('Creating temp resources...')
-    frame_paths = copy_frames_from_directory(directory_path)
-    for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
-        update_status('Progressing...', frame_processor.NAME)
-        frame_processor.process_video(source_path, frame_paths)
-        release_resources()
-    clean_temp(directory_path)
-    update_status('Processing directory succeed!')
+    unprocessed_dir = os.path.join(directory_path, "Unprocessed")
+    output_dir = os.path.join(directory_path, "output")
+    os.makedirs(unprocessed_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # --- Phase 1: Sort folder ---
+    update_status("Sorting folder by face...", "DLC.CORE")
+    for filename in os.listdir(directory_path):
+        file_path = os.path.join(directory_path, filename)
+
+        if filename in ["Unprocessed", "output"]:
+            continue  # skip output folders
+
+        if is_video(file_path):
+            print(f"[VIDEO] Queued for processing: {filename}")
+            continue  # skip sorting videos
+
+        if not is_image(file_path):
+            print(f"[SKIP] Not an image: {filename}")
+            continue
+
+        img = cv2.imread(file_path)
+        if img is None:
+            print(f"[ERROR] Failed to read: {filename}")
+            continue
+
+        if not get_one_face(img):
+            dest_path = os.path.join(unprocessed_dir, filename)
+            print(f"[MOVE] No face found: {filename} → {dest_path}")
+            shutil.move(file_path, dest_path)
+
+    # --- Phase 2: Process files ---
+    update_status("Processing files...", "DLC.CORE")
+    for filename in os.listdir(directory_path):
+        file_path = os.path.join(directory_path, filename)
+
+        if filename in ["Unprocessed", "output"]:
+            continue  # skip special folders
+
+        if not (is_image(file_path) or is_video(file_path)):
+            print(f"[SKIP] Unknown file type: {filename}")
+            continue
+
+        print(f"[PROCESS] {filename}")
+
+        # Update globals for start()
+        modules.globals.target_path = file_path
+        modules.globals.output_path = os.path.join(output_dir, filename)
+
+        start()  # run normal start pipeline for this file
+
+    update_status("Processing directory completed!", "DLC.CORE")
+
+
 
 def start() -> None:
     for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
@@ -210,6 +296,7 @@ def start() -> None:
         else:
             update_status('Processing to image failed!')
         return
+
     # process image to videos
     if modules.globals.nsfw_filter and ui.check_and_ignore_nsfw(modules.globals.target_path, destroy):
         return
@@ -225,7 +312,8 @@ def start() -> None:
         update_status('Progressing...', frame_processor.NAME)
         frame_processor.process_video(modules.globals.source_path, temp_frame_paths)
         release_resources()
-    # handles fps
+
+    # handles fps / audio / cleanup...
     if modules.globals.keep_fps:
         update_status('Detecting fps...')
         fps = detect_fps(modules.globals.target_path)
@@ -234,7 +322,7 @@ def start() -> None:
     else:
         update_status('Creating video with 30.0 fps...')
         create_video(modules.globals.target_path)
-    # handle audio
+
     if modules.globals.keep_audio:
         if modules.globals.keep_fps:
             update_status('Restoring audio...')
@@ -243,13 +331,12 @@ def start() -> None:
         restore_audio(modules.globals.target_path, modules.globals.output_path)
     else:
         move_temp(modules.globals.target_path, modules.globals.output_path)
-    # clean and validate
+
     clean_temp(modules.globals.target_path)
     if is_video(modules.globals.target_path):
         update_status('Processing to video succeed!')
     else:
         update_status('Processing to video failed!')
-
 
 def destroy(to_quit=True) -> None:
     if modules.globals.target_path:

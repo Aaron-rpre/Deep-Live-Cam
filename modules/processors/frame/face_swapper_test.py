@@ -20,7 +20,11 @@ import os
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 NAME = "DLC.FACE-SWAPPER"
-
+from modules.face_analyser import (
+    get_source_face_with_gender,
+    get_target_faces_with_gender_filter
+)
+GENDER_FILTER_ENABLED = getattr(modules.globals, "gender_filter", False)
 abs_dir = os.path.dirname(os.path.abspath(__file__))
 models_dir = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(abs_dir))), "models"
@@ -73,9 +77,6 @@ def get_face_swapper() -> Any:
 
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
-    print("Source face landmarks:", source_face)
-    print("Target face landmarks:", target_face)
-
     face_swapper = get_face_swapper()
 
     # Apply the face swap
@@ -105,31 +106,62 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
 
     return swapped_frame
 
+def get_faces_with_optional_gender_filter(temp_frame: Frame):
+    """
+    Returns the source face and target faces,
+    applying gender filter if enabled.
+    """
+    if GENDER_FILTER_ENABLED:
+        source_face, source_gender = get_source_face_with_gender(
+            cv2.imread(modules.globals.source_path)
+        )
+        if not source_face:
+            logging.error("No source face detected for gender filtering.")
+            return None, []
+
+        target_faces = get_target_faces_with_gender_filter(temp_frame, source_gender)
+        return source_face, target_faces
+
+    # Default behaviour without gender filter
+    source_face = get_one_face(cv2.imread(modules.globals.source_path))
+    return source_face, get_many_faces(temp_frame)
 
 def process_frame(source_face: Face, temp_frame: Frame) -> Frame:
     if modules.globals.color_correction:
         temp_frame = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)
 
-    if modules.globals.many_faces:
-        many_faces = get_many_faces(temp_frame)
-        if many_faces:
-            for target_face in many_faces:
+    if GENDER_FILTER_ENABLED:
+        # Get source face with gender and age
+        source_face, source_gender, source_age = get_source_face_with_gender_age(
+            cv2.imread(modules.globals.source_path)
+        )
 
-                # GENDER FILTER CHECK
-                if hasattr(modules.globals, "gender_filter") and modules.globals.gender_filter:
-                    if target_face.get("gender") != source_face.get("gender"):
-                        continue  # skip mismatched gender faces
+        if not source_face:
+            logging.error("No source face detected for gender/age filtering.")
+            return temp_frame
 
-                if source_face and target_face:
-                    temp_frame = swap_face(source_face, target_face, temp_frame)
-                else:
-                    print("Face detection failed for target/source.")
+        # Detect all faces in the frame
+        target_faces = get_many_faces(temp_frame)
+        target_faces = get_matching_faces_by_gender_age(target_faces, source_gender, source_age)
+
+        if not target_faces:
+            logging.debug("No target faces matched gender/age filter.")
+            return temp_frame
+
     else:
-        target_face = get_one_face(temp_frame)
-        if target_face and source_face:
+        # Original Deep-Live-Cam behaviour
+        if modules.globals.many_faces:
+            target_faces = get_many_faces(temp_frame)
+        else:
+            single_face = get_one_face(temp_frame)
+            target_faces = [single_face] if single_face else []
+
+    # Swap for each target face
+    for target_face in target_faces:
+        if source_face and target_face:
             temp_frame = swap_face(source_face, target_face, temp_frame)
         else:
-            logging.error("Face detection failed for target or source.")
+            logging.error("Face detection failed for target/source.")
 
     return temp_frame
 
@@ -141,6 +173,9 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
             source_face = default_source_face()
             for map in modules.globals.source_target_map:
                 target_face = map["target"]["face"]
+                print("[DEBUG] source_face:", source_face)
+                print("[DEBUG] target_face:", target_face)
+
                 temp_frame = swap_face(source_face, target_face, temp_frame)
 
         elif not modules.globals.many_faces:
@@ -148,6 +183,9 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
                 if "source" in map:
                     source_face = map["source"]["face"]
                     target_face = map["target"]["face"]
+                    print("[DEBUG] source_face:", source_face)
+                    print("[DEBUG] target_face:", target_face)
+
                     temp_frame = swap_face(source_face, target_face, temp_frame)
 
     elif is_video(modules.globals.target_path):
@@ -256,7 +294,6 @@ def process_frames(
 def process_image(source_path: str, target_path: str, output_path: str) -> None:
     if not modules.globals.map_faces:
         source_face = get_one_face(cv2.imread(source_path))
-        print("Cty: ", source_face)
         target_frame = cv2.imread(target_path)
         result = process_frame(source_face, target_frame)
         cv2.imwrite(output_path, result)
@@ -283,8 +320,6 @@ def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
 def create_lower_mouth_mask(
     face: Face, frame: Frame
 ) -> (np.ndarray, np.ndarray, tuple, np.ndarray):
-    #print(f"[DEBUG] landmarks: {face.landmark_2d_106}")
-
     mask = np.zeros(frame.shape[:2], dtype=np.uint8)
     mouth_cutout = None
     landmarks = face.landmark_2d_106
@@ -617,21 +652,6 @@ def create_face_mask(face: Face, frame: Frame) -> np.ndarray:
 
     return mask
 
-def extract_face_data(frame):
-    faces = get_face_analyser().get(frame)
-    results = []
-
-    for face in faces:
-        results.append({
-            "bbox": face.bbox,
-            "kps": face.landmark if hasattr(face, "landmark") else None,
-            "det_score": face.det_score,
-            "gender": getattr(face, "gender", None),
-            "age": getattr(face, "age", None),
-            "embedding": getattr(face, "normed_embedding", None)
-        })
-
-    return results
 
 def apply_color_transfer(source, target):
     """

@@ -105,10 +105,28 @@ def save_switch_states():
         "show_fps": modules.globals.show_fps,
         "mouth_mask": modules.globals.mouth_mask,
         "show_mouth_mask_box": modules.globals.show_mouth_mask_box,
+        "selected_face_path": getattr(modules.globals, "source_path", None),  # ✅ new
     }
     with open("switch_states.json", "w") as f:
         json.dump(switch_states, f)
 
+
+VALID_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".mp4", ".avi", ".mov", ".mkv")
+
+def start_directory(start_func, directory_path):
+    output_dir = os.path.join(directory_path, "output")
+    os.makedirs(output_dir, exist_ok=True)
+
+    for file in os.listdir(directory_path):
+        file_path = os.path.join(directory_path, file)
+
+        if os.path.isfile(file_path) and file.lower().endswith(VALID_EXTENSIONS):
+            g.source_path = file_path
+            g.target_path = file_path
+            g.output_path = os.path.join(output_dir, os.path.basename(file))
+
+            print(f"[DLC] Starting processing for: {file_path}")
+            start_func()
 
 def load_switch_states():
     try:
@@ -129,6 +147,7 @@ def load_switch_states():
         modules.globals.show_mouth_mask_box = switch_states.get(
             "show_mouth_mask_box", False
         )
+        modules.globals.source_path = switch_states.get("selected_face_path", None)  # ✅ new
     except FileNotFoundError:
         # If the file doesn't exist, use default values
         pass
@@ -386,7 +405,8 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     donate_label.bind(
         "<Button>", lambda event: webbrowser.open("https://deeplivecam.net")
     )
-
+    if modules.globals.source_path:
+        select_source_path_automatically(modules.globals.source_path)
     return root
 
 def close_mapper_window():
@@ -490,6 +510,17 @@ def create_source_target_popup(
     )
     close_button.grid(row=2, column=0, pady=10)
 
+def select_source_path_automatically(saved_path: str) -> None:
+    global RECENT_DIRECTORY_SOURCE
+
+    if not saved_path or not os.path.exists(saved_path):
+        return  # nothing to do if no saved path or file missing
+
+    RECENT_DIRECTORY_SOURCE = os.path.dirname(saved_path)
+    modules.globals.source_path = saved_path
+    image = render_image_preview(saved_path, (200, 200))
+    source_label.configure(image=image)
+    save_switch_states()
 
 def update_popup_source(
         scrollable_frame: ctk.CTkScrollableFrame, map: list, button_num: int
@@ -601,6 +632,7 @@ def select_source_path() -> None:
         RECENT_DIRECTORY_SOURCE = os.path.dirname(modules.globals.source_path)
         image = render_image_preview(modules.globals.source_path, (200, 200))
         source_label.configure(image=image)
+        save_switch_states()
     else:
         modules.globals.source_path = None
         source_label.configure(image=None)
@@ -682,17 +714,24 @@ def select_output_path(start: Callable[[], None]) -> None:
 
 
 def select_directory_and_process() -> None:
+    from modules import core
     global RECENT_DIRECTORY_TARGET
 
-    PREVIEW.withdraw()
+    # Hide preview window if it's running
+    if hasattr(modules.globals, "PREVIEW"):
+        try:
+            modules.globals.PREVIEW.withdraw()
+        except Exception:
+            pass
+
     directory_path = ctk.filedialog.askdirectory(
-        title=_("select directory"), initialdir=RECENT_DIRECTORY_TARGET
+        title="Select directory",
+        initialdir=RECENT_DIRECTORY_TARGET
     )
+
     if directory_path:
         RECENT_DIRECTORY_TARGET = directory_path
-        from modules import core
         core.process_directory(modules.globals.source_path, directory_path)
-
 
 def check_and_ignore_nsfw(target, destroy: Callable = None) -> bool:
     """Check if the target is NSFW.
@@ -1174,7 +1213,6 @@ def update_webcam_source(
             update_pop_live_status("Face could not be detected in last upload!")
         return map
 
-
 def update_webcam_target(
         scrollable_frame: ctk.CTkScrollableFrame, map: list, button_num: int
 ) -> list:
@@ -1225,3 +1263,10 @@ def update_webcam_target(
         else:
             update_pop_live_status("Face could not be detected in last upload!")
         return map
+
+def start_directory(start, directory_path):
+    for file in os.listdir(directory_path):
+        full_path = os.path.join(directory_path, file)
+        if is_image(full_path) or is_video(full_path):
+            modules.globals.target_path = full_path
+            start()
