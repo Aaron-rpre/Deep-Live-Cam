@@ -17,6 +17,13 @@ from modules.utilities import (
 from modules.cluster_analysis import find_closest_centroid
 import os
 
+def pad_frame(frame, pad_px=64):
+    """
+    Pads an image using reflection to avoid edge artifacts during warps.
+    """
+    return cv2.copyMakeBorder(frame, pad_px, pad_px, pad_px, pad_px, cv2.BORDER_REFLECT_101)
+
+
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 NAME = "DLC.FACE-SWAPPER"
@@ -106,123 +113,112 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     return swapped_frame
 
 
-def process_frame(source_face: Face, temp_frame: Frame) -> Frame:
+PAD = 64  # Global padding to handle edge faces
+
+def process_frame(source_face: 'Face', temp_frame: 'Frame') -> 'Frame':
+    # Pad frame to prevent edge artifacts
+    padded_frame = pad_frame(temp_frame, PAD)
+
+    # Optional color correction
     if modules.globals.color_correction:
-        temp_frame = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)
+        padded_frame = cv2.cvtColor(padded_frame, cv2.COLOR_BGR2RGB)
 
     if modules.globals.many_faces:
-        many_faces = get_many_faces(temp_frame)
+        many_faces = get_many_faces(padded_frame)
         if many_faces:
             for target_face in many_faces:
-
                 # GENDER FILTER CHECK
-                if hasattr(modules.globals, "gender_filter") and modules.globals.gender_filter:
+                if getattr(modules.globals, "gender_filter", False):
                     if target_face.get("gender") != source_face.get("gender"):
                         continue  # skip mismatched gender faces
 
                 if source_face and target_face:
-                    temp_frame = swap_face(source_face, target_face, temp_frame)
+                    padded_frame = swap_face(source_face, target_face, padded_frame)
                 else:
-                    print("Face detection failed for target/source.")
+                    logging.warning("Face detection failed for target/source.")
     else:
-        target_face = get_one_face(temp_frame)
+        target_face = get_one_face(padded_frame)
         if target_face and source_face:
-            temp_frame = swap_face(source_face, target_face, temp_frame)
+            padded_frame = swap_face(source_face, target_face, padded_frame)
         else:
             logging.error("Face detection failed for target or source.")
 
-    return temp_frame
+    # Crop back to original frame size to remove padding
+    final_frame = padded_frame[PAD:-PAD, PAD:-PAD] if PAD else padded_frame
+    return final_frame
 
 
+def process_frame_v2(temp_frame: 'Frame', temp_frame_path: str = "") -> 'Frame':
+    # Pad frame to prevent edge artifacts
+    padded_frame = pad_frame(temp_frame, PAD)
 
-def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
     if is_image(modules.globals.target_path):
         if modules.globals.many_faces:
             source_face = default_source_face()
-            for map in modules.globals.source_target_map:
-                target_face = map["target"]["face"]
-                temp_frame = swap_face(source_face, target_face, temp_frame)
-
-        elif not modules.globals.many_faces:
-            for map in modules.globals.source_target_map:
-                if "source" in map:
-                    source_face = map["source"]["face"]
-                    target_face = map["target"]["face"]
-                    temp_frame = swap_face(source_face, target_face, temp_frame)
+            for mapping in modules.globals.source_target_map:
+                target_face = mapping["target"]["face"]
+                padded_frame = swap_face(source_face, target_face, padded_frame)
+        else:
+            for mapping in modules.globals.source_target_map:
+                if "source" in mapping:
+                    source_face = mapping["source"]["face"]
+                    target_face = mapping["target"]["face"]
+                    padded_frame = swap_face(source_face, target_face, padded_frame)
 
     elif is_video(modules.globals.target_path):
         if modules.globals.many_faces:
             source_face = default_source_face()
-            for map in modules.globals.source_target_map:
-                target_frame = [
-                    f
-                    for f in map["target_faces_in_frame"]
+            for mapping in modules.globals.source_target_map:
+                target_frames = [
+                    f for f in mapping["target_faces_in_frame"]
                     if f["location"] == temp_frame_path
                 ]
-
-                for frame in target_frame:
+                for frame in target_frames:
                     for target_face in frame["faces"]:
-                        temp_frame = swap_face(source_face, target_face, temp_frame)
-
-        elif not modules.globals.many_faces:
-            for map in modules.globals.source_target_map:
-                if "source" in map:
-                    target_frame = [
-                        f
-                        for f in map["target_faces_in_frame"]
+                        padded_frame = swap_face(source_face, target_face, padded_frame)
+        else:
+            for mapping in modules.globals.source_target_map:
+                if "source" in mapping:
+                    source_face = mapping["source"]["face"]
+                    target_frames = [
+                        f for f in mapping["target_faces_in_frame"]
                         if f["location"] == temp_frame_path
                     ]
-                    source_face = map["source"]["face"]
-
-                    for frame in target_frame:
+                    for frame in target_frames:
                         for target_face in frame["faces"]:
-                            temp_frame = swap_face(source_face, target_face, temp_frame)
+                            padded_frame = swap_face(source_face, target_face, padded_frame)
 
     else:
-        detected_faces = get_many_faces(temp_frame)
-        if modules.globals.many_faces:
-            if detected_faces:
-                source_face = default_source_face()
-                for target_face in detected_faces:
-                    temp_frame = swap_face(source_face, target_face, temp_frame)
+        detected_faces = get_many_faces(padded_frame)
+        if modules.globals.many_faces and detected_faces:
+            source_face = default_source_face()
+            for target_face in detected_faces:
+                padded_frame = swap_face(source_face, target_face, padded_frame)
+        elif not modules.globals.many_faces and detected_faces:
+            if len(detected_faces) <= len(modules.globals.simple_map["target_embeddings"]):
+                for i, detected_face in enumerate(detected_faces):
+                    closest_index, _ = find_closest_centroid(
+                        modules.globals.simple_map["target_embeddings"],
+                        detected_face.normed_embedding
+                    )
+                    padded_frame = swap_face(
+                        modules.globals.simple_map["source_faces"][closest_index],
+                        detected_face,
+                        padded_frame
+                    )
+            else:
+                detected_embeddings = [f.normed_embedding for f in detected_faces]
+                for i, target_embedding in enumerate(modules.globals.simple_map["target_embeddings"]):
+                    closest_index, _ = find_closest_centroid(detected_embeddings, target_embedding)
+                    padded_frame = swap_face(
+                        modules.globals.simple_map["source_faces"][i],
+                        detected_faces[closest_index],
+                        padded_frame
+                    )
 
-        elif not modules.globals.many_faces:
-            if detected_faces:
-                if len(detected_faces) <= len(
-                    modules.globals.simple_map["target_embeddings"]
-                ):
-                    for detected_face in detected_faces:
-                        closest_centroid_index, _ = find_closest_centroid(
-                            modules.globals.simple_map["target_embeddings"],
-                            detected_face.normed_embedding,
-                        )
-
-                        temp_frame = swap_face(
-                            modules.globals.simple_map["source_faces"][
-                                closest_centroid_index
-                            ],
-                            detected_face,
-                            temp_frame,
-                        )
-                else:
-                    detected_faces_centroids = []
-                    for face in detected_faces:
-                        detected_faces_centroids.append(face.normed_embedding)
-                    i = 0
-                    for target_embedding in modules.globals.simple_map[
-                        "target_embeddings"
-                    ]:
-                        closest_centroid_index, _ = find_closest_centroid(
-                            detected_faces_centroids, target_embedding
-                        )
-
-                        temp_frame = swap_face(
-                            modules.globals.simple_map["source_faces"][i],
-                            detected_faces[closest_centroid_index],
-                            temp_frame,
-                        )
-                        i += 1
-    return temp_frame
+    # Crop back to original size
+    final_frame = padded_frame[PAD:-PAD, PAD:-PAD] if PAD else padded_frame
+    return final_frame
 
 
 def process_frames(
